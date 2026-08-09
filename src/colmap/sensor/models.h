@@ -416,6 +416,81 @@ struct BasePerspectiveFisheyeCameraModel
     }
   }
 
+  // Map a camera-frame direction to fisheye angular coordinates, for any
+  // theta in [0, pi).
+  //
+  // FisheyeFromNormal takes (u/w, v/w) and recovers theta as atan(r/w), which
+  // requires w > 0: at theta >= 90 deg the ray is parallel to or behind the
+  // z = 1 plane and has no image on it. Taking the angle as atan2(r, w)
+  // instead needs no such plane. The two agree exactly for w > 0, so this is
+  // a strict extension of the previous behaviour rather than a change to it,
+  // and models with FOV <= 180 deg are unaffected.
+  template <typename T>
+  static inline bool FisheyeFromCam(
+      const T& u, const T& v, const T& w, T* uu, T* vv) {
+    const T r = ceres::sqrt(u * u + v * v);
+    if (r <= T(std::numeric_limits<double>::epsilon())) {
+      // On the optical axis the azimuth is undefined. Forward is theta = 0;
+      // straight back has no representable image point.
+      if (w < T(0)) {
+        return false;
+      }
+      *uu = T(0);
+      *vv = T(0);
+      return true;
+    }
+    const T theta = ceres::atan2(r, w);
+    *uu = u * theta / r;
+    *vv = v * theta / r;
+    return true;
+  }
+
+  // Unproject a pixel to a unit bearing vector, for any theta in [0, pi).
+  //
+  // Overrides BasePerspectiveCameraModel::CamRayFromImg, whose default routes
+  // through CameraModel::CamFromImg and therefore always returns rz > 0 --
+  // correct only while the fisheye stays inside the forward hemisphere. Here
+  // the bearing is built from the angular coordinates directly:
+  //
+  //   (uu, vv) = theta * (cos phi, sin phi)
+  //   bearing  = (sin theta cos phi, sin theta sin phi, cos theta)
+  //
+  // which is the exact inverse of FisheyeFromCam and agrees with the default
+  // implementation to round-off wherever that one is valid.
+  static inline bool CamRayFromImg(const double* params,
+                                   double x,
+                                   double y,
+                                   double* rx,
+                                   double* ry,
+                                   double* rz) {
+    double uu = 0;
+    double vv = 0;
+    CameraModel::FisheyeFromImg(params, x, y, &uu, &vv);
+    if constexpr (CameraModel::num_extra_params > 0) {
+      if (!CameraModel::IterativeUndistortion(
+              &params[CameraModel::extra_params_idxs[0]], &uu, &vv)) {
+        return false;
+      }
+    }
+    const double theta = std::sqrt(uu * uu + vv * vv);
+    if (theta >= EIGEN_PI) {
+      // Outside the model's domain: the equidistant map is only injective up
+      // to a full 360 deg field.
+      return false;
+    }
+    if (theta <= std::numeric_limits<double>::epsilon()) {
+      *rx = 0.0;
+      *ry = 0.0;
+      *rz = 1.0;
+      return true;
+    }
+    const double sin_theta = std::sin(theta);
+    *rx = sin_theta * uu / theta;
+    *ry = sin_theta * vv / theta;
+    *rz = std::cos(theta);
+    return true;
+  }
+
  private:
   BasePerspectiveFisheyeCameraModel() = default;
   friend CameraModel;
@@ -1586,12 +1661,10 @@ void OpenCVFisheyeCameraModel::FisheyeFromImg(
 template <typename T>
 bool OpenCVFisheyeCameraModel::ImgFromCam(
     const T* params, const T& u, const T& v, const T& w, T* x, T* y) {
-  if (w < std::numeric_limits<T>::epsilon()) {
+  T uu, vv;
+  if (!FisheyeFromCam(u, v, w, &uu, &vv)) {
     return false;
   }
-
-  T uu, vv;
-  FisheyeFromNormal(u / w, v / w, &uu, &vv);
 
   // Distortion
   T duu, dvv;
@@ -1924,12 +1997,10 @@ void SimpleRadialFisheyeCameraModel::FisheyeFromImg(
 template <typename T>
 bool SimpleRadialFisheyeCameraModel::ImgFromCam(
     const T* params, const T& u, const T& v, const T& w, T* x, T* y) {
-  if (w < std::numeric_limits<T>::epsilon()) {
+  T uu, vv;
+  if (!FisheyeFromCam(u, v, w, &uu, &vv)) {
     return false;
   }
-
-  T uu, vv;
-  FisheyeFromNormal(u / w, v / w, &uu, &vv);
 
   // Distortion
   T duu, dvv;
@@ -2012,12 +2083,10 @@ void RadialFisheyeCameraModel::FisheyeFromImg(
 template <typename T>
 bool RadialFisheyeCameraModel::ImgFromCam(
     const T* params, const T& u, const T& v, const T& w, T* x, T* y) {
-  if (w < std::numeric_limits<T>::epsilon()) {
+  T uu, vv;
+  if (!FisheyeFromCam(u, v, w, &uu, &vv)) {
     return false;
   }
-
-  T uu, vv;
-  FisheyeFromNormal(u / w, v / w, &uu, &vv);
 
   // Distortion
   T duu, dvv;
@@ -2116,12 +2185,10 @@ void ThinPrismFisheyeCameraModel::FisheyeFromImg(
 template <typename T>
 bool ThinPrismFisheyeCameraModel::ImgFromCam(
     const T* params, const T& u, const T& v, const T& w, T* x, T* y) {
-  if (w < std::numeric_limits<T>::epsilon()) {
+  T uu, vv;
+  if (!FisheyeFromCam(u, v, w, &uu, &vv)) {
     return false;
   }
-
-  T uu, vv;
-  FisheyeFromNormal(u / w, v / w, &uu, &vv);
 
   // Distortion
   T duu, dvv;
@@ -2231,12 +2298,10 @@ void RadTanThinPrismFisheyeModel::FisheyeFromImg(
 template <typename T>
 bool RadTanThinPrismFisheyeModel::ImgFromCam(
     const T* params, const T& u, const T& v, const T& w, T* x, T* y) {
-  if (w < std::numeric_limits<T>::epsilon()) {
+  T uu, vv;
+  if (!FisheyeFromCam(u, v, w, &uu, &vv)) {
     return false;
   }
-
-  T uu, vv;
-  FisheyeFromNormal(u / w, v / w, &uu, &vv);
 
   T duu, dvv;
   Distortion(&params[4], uu, vv, &duu, &dvv);
@@ -2524,12 +2589,10 @@ void SimpleFisheyeCameraModel::FisheyeFromImg(
 template <typename T>
 bool SimpleFisheyeCameraModel::ImgFromCam(
     const T* params, const T& u, const T& v, const T& w, T* x, T* y) {
-  if (w < std::numeric_limits<T>::epsilon()) {
+  T uu, vv;
+  if (!FisheyeFromCam(u, v, w, &uu, &vv)) {
     return false;
   }
-
-  T uu, vv;
-  FisheyeFromNormal(u / w, v / w, &uu, &vv);
 
   // No distortion
 
@@ -2599,12 +2662,10 @@ void FisheyeCameraModel::FisheyeFromImg(
 template <typename T>
 bool FisheyeCameraModel::ImgFromCam(
     const T* params, const T& u, const T& v, const T& w, T* x, T* y) {
-  if (w < std::numeric_limits<T>::epsilon()) {
+  T uu, vv;
+  if (!FisheyeFromCam(u, v, w, &uu, &vv)) {
     return false;
   }
-
-  T uu, vv;
-  FisheyeFromNormal(u / w, v / w, &uu, &vv);
 
   // No distortion
 

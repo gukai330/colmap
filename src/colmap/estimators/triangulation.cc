@@ -100,11 +100,13 @@ void TriangulationEstimator::Estimate(const std::vector<X_t>& point_data,
   }
 
   // Cheirality. Perspective cameras require positive depth (the point in front
-  // of the local +Z axis). Omnidirectional cameras (e.g. EQUIRECTANGULAR) have
-  // no single front, but the point must still lie in the half-space the
-  // observed bearing points toward.
+  // of the local +Z axis). Omnidirectional cameras (e.g. EQUIRECTANGULAR) and
+  // fisheyes have no single front, but the point must still lie in the
+  // half-space the observed bearing points toward -- which for a ray inside the
+  // forward hemisphere is the same test, only expressed without the z-divide.
   for (size_t i = 0; i < pose_data.size(); ++i) {
-    if (pose_data[i].camera->IsPerspective()) {
+    if (pose_data[i].camera->IsPerspective() &&
+        !pose_data[i].camera->IsFisheye()) {
       if (!HasPointPositiveDepth(pose_data[i].cam_from_world, xyz)) {
         return;
       }

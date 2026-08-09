@@ -412,7 +412,9 @@ size_t ObservationManager::FilterObservationsWithNegativeDepth() {
   for (const frame_t frame_id : reconstruction_.RegFrameIds()) {
     for (const data_t& data_id : reconstruction_.Frame(frame_id).ImageIds()) {
       const Image& image = reconstruction_.Image(data_id.id);
-      if (image.CameraPtr()->IsSpherical()) {
+      // Cheirality does not apply to cameras that can see behind their own +Z
+      // axis: spherical, and fisheyes wider than 180 deg.
+      if (image.CameraPtr()->IsSpherical() || image.CameraPtr()->IsFisheye()) {
         continue;
       }
       const Eigen::Matrix3x4d cam_from_world = image.CamFromWorld().ToMatrix();
@@ -534,7 +536,7 @@ size_t ObservationManager::FilterPoints3DWithLargeReprojectionError(
         case ReprojectionErrorType::NORMALIZED: {
           const Eigen::Vector3d point3D_in_cam =
               image.CamFromWorld() * point3D.xyz;
-          if (camera.IsPerspective()) {
+          if (camera.IsPerspective() && !camera.IsFisheye()) {
             constexpr double kMinDepth = 1e-12;
             const std::optional<Eigen::Vector2d> cam_point =
                 camera.CamFromImg(point2D.xy);
@@ -544,11 +546,16 @@ size_t ObservationManager::FilterPoints3DWithLargeReprojectionError(
                           .norm()
                     : std::numeric_limits<double>::infinity();
           } else {
-            // Omnidirectional cameras (e.g. EQUIRECTANGULAR) have no pinhole
-            // z-divide and legitimately observe points behind the local +Z
-            // axis, so the cheirality gate and 2D CamFromImg above do not
-            // apply. Compare unit bearings instead (chord distance ~= angle for
-            // small errors, consistent with the normalized threshold).
+            // Omnidirectional cameras (e.g. EQUIRECTANGULAR) and fisheyes have
+            // no pinhole z-divide and legitimately observe points behind the
+            // local +Z axis, so the cheirality gate and 2D CamFromImg above do
+            // not apply. Compare unit bearings instead (chord distance ~= angle
+            // for small errors, consistent with the normalized threshold).
+            //
+            // Fisheyes were previously routed to the branch above, which made
+            // the effective tolerance 0.01*cos^2(theta) of angle and, past
+            // theta = 90 deg, +infinity unconditionally -- no threshold could
+            // keep a wide-fisheye rim observation.
             const std::optional<Eigen::Vector3d> cam_ray =
                 camera.CamRayFromImg(point2D.xy);
             observation_error =
