@@ -469,8 +469,16 @@ struct BasePerspectiveFisheyeCameraModel
       if (w < T(0)) {
         return false;
       }
-      *uu = T(0);
-      *vv = T(0);
+      // (u, v) / w rather than the constant 0: the same value to first order,
+      // but it keeps the derivative (1/w) for autodiff, matching
+      // FisheyeFromCamWithJac and the old FisheyeFromNormal.
+      if (w > T(0)) {
+        *uu = u / w;
+        *vv = v / w;
+      } else {
+        *uu = T(0);
+        *vv = T(0);
+      }
       return true;
     }
     const T theta = ceres::atan2(r, w);

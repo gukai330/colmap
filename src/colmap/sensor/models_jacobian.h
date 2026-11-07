@@ -133,6 +133,71 @@ inline void UvwJacFromAbJac(
   J_uvw[5] = -(J_ab[2] * a + J_ab[3] * b) * inv_w;
 }
 
+// Fisheye angular coordinates directly from a camera-frame direction (u, v, w),
+// for any incidence angle theta = atan2(r, w) in [0, pi), r = sqrt(u^2 + v^2):
+//   (uu, vv) = (theta / r) * (u, v).
+// Mirrors BasePerspectiveFisheyeCameraModel::FisheyeFromCam, the patched value
+// path. The older FisheyeProjectionWithJac above goes through (a, b) = (u/w, v/w)
+// and atan(r/w), which needs w > 0: a theta > 90 deg observation (w < 0) has no
+// image on the z = 1 plane, so every fisheye ImgFromCamWithJac used to return
+// false there -- and the BA cost functors turn false into a ZERO residual.
+// Returns false only on the exact back axis (r = 0, w < 0).
+//
+// When J_uvw is non-null it receives the row-major 2x3 Jacobian
+// d(uu, vv) / d(u, v, w). With rho2 = r^2 + w^2, s = theta / r and
+// g = (w / rho2 - s) / r^2:
+//   d(uu)/du = s + u^2 g   d(uu)/dv = u v g       d(uu)/dw = -u / rho2
+//   d(vv)/du = u v g       d(vv)/dv = s + v^2 g   d(vv)/dw = -v / rho2
+// For w > 0 this equals FisheyeProjectionWithJac chained through (u/w, v/w)
+// exactly (UvwJacFromAbJac), so nothing changes in the forward hemisphere.
+inline bool FisheyeFromCamWithJac(
+    double u, double v, double w, double* uu, double* vv, double* J_uvw) {
+  const double r2 = u * u + v * v;
+  const double r = std::sqrt(r2);
+  if (r < std::numeric_limits<double>::epsilon()) {
+    // On the optical axis. Forward: (uu, vv) = (u, v) / w to first order, the
+    // limit of the same formulas. Straight back has no image point.
+    if (!(w > 0.0)) {
+      return false;
+    }
+    const double inv_w = 1.0 / w;
+    *uu = u * inv_w;
+    *vv = v * inv_w;
+    if (J_uvw) {
+      J_uvw[0] = inv_w;
+      J_uvw[1] = 0.0;
+      J_uvw[2] = -u * inv_w * inv_w;
+      J_uvw[3] = 0.0;
+      J_uvw[4] = inv_w;
+      J_uvw[5] = -v * inv_w * inv_w;
+    }
+    return true;
+  }
+  const double theta = std::atan2(r, w);
+  const double s = theta / r;
+  *uu = s * u;
+  *vv = s * v;
+  if (J_uvw) {
+    const double rho2 = r2 + w * w;
+    const double g = (w / rho2 - s) / r2;
+    J_uvw[0] = s + u * u * g;
+    J_uvw[1] = u * v * g;
+    J_uvw[2] = -u / rho2;
+    J_uvw[3] = u * v * g;
+    J_uvw[4] = s + v * v * g;
+    J_uvw[5] = -v / rho2;
+  }
+  return true;
+}
+
+// out (2x3) = lhs (2x2) * rhs (2x3), all row-major.
+inline void MatMul2x2x3(const double* lhs, const double* rhs, double* out) {
+  for (int c = 0; c < 3; ++c) {
+    out[c] = lhs[0] * rhs[c] + lhs[1] * rhs[3 + c];
+    out[3 + c] = lhs[2] * rhs[c] + lhs[3] * rhs[3 + c];
+  }
+}
+
 }  // namespace internal
 
 template <bool Enable, typename std::enable_if<Enable, int>::type>
@@ -733,22 +798,23 @@ bool SimpleRadialFisheyeCameraModel::ImgFromCamWithJac(
     double* J_params,
     double* J_uvw,
     const bool check_cheirality) {
-  if (!HasProjectableDepth(w, check_cheirality)) {
-    return false;
-  }
 
   const double f = params[0];
   const double c1 = params[1];
   const double c2 = params[2];
   const double k = params[3];
 
-  const double inv_w = 1.0 / w;
-  const double a = u * inv_w;
-  const double b = v * inv_w;
-
-  double uu, vv, J_fisheye[4] = {};
-  internal::FisheyeProjectionWithJac(
-      a, b, &uu, &vv, J_uvw ? J_fisheye : nullptr);
+  // (uu, vv) is the chain variable here: everything below differentiates
+  // w.r.t. it (J_fisheye = identity), and d(uu, vv) / d(u, v, w) from
+  // FisheyeFromCamWithJac is applied last. That is what lets theta > 90 deg
+  // (w < 0) through; check_cheirality does not apply to a fisheye.
+  (void)check_cheirality;
+  double uu, vv, J_fisheye_uvw[6] = {};
+  const double J_fisheye[4] = {1.0, 0.0, 0.0, 1.0};
+  if (!internal::FisheyeFromCamWithJac(
+          u, v, w, &uu, &vv, J_uvw ? J_fisheye_uvw : nullptr)) {
+    return false;
+  }
 
   // Single-parameter radial distortion in fisheye coordinates.
   const double uu2 = uu * uu;
@@ -771,7 +837,7 @@ bool SimpleRadialFisheyeCameraModel::ImgFromCamWithJac(
     double m[4];
     internal::MatMul2x2(ipjd, J_fisheye, m);
     const double J_ab[4] = {f * m[0], f * m[1], f * m[2], f * m[3]};
-    internal::UvwJacFromAbJac(J_ab, a, b, inv_w, J_uvw);
+    internal::MatMul2x2x3(J_ab, J_fisheye_uvw, J_uvw);
   }
 
   if (J_params) {
@@ -799,9 +865,6 @@ bool RadialFisheyeCameraModel::ImgFromCamWithJac(const double* params,
                                                  double* J_params,
                                                  double* J_uvw,
                                                  const bool check_cheirality) {
-  if (!HasProjectableDepth(w, check_cheirality)) {
-    return false;
-  }
 
   const double f = params[0];
   const double c1 = params[1];
@@ -809,13 +872,17 @@ bool RadialFisheyeCameraModel::ImgFromCamWithJac(const double* params,
   const double k1 = params[3];
   const double k2 = params[4];
 
-  const double inv_w = 1.0 / w;
-  const double a = u * inv_w;
-  const double b = v * inv_w;
-
-  double uu, vv, J_fisheye[4] = {};
-  internal::FisheyeProjectionWithJac(
-      a, b, &uu, &vv, J_uvw ? J_fisheye : nullptr);
+  // (uu, vv) is the chain variable here: everything below differentiates
+  // w.r.t. it (J_fisheye = identity), and d(uu, vv) / d(u, v, w) from
+  // FisheyeFromCamWithJac is applied last. That is what lets theta > 90 deg
+  // (w < 0) through; check_cheirality does not apply to a fisheye.
+  (void)check_cheirality;
+  double uu, vv, J_fisheye_uvw[6] = {};
+  const double J_fisheye[4] = {1.0, 0.0, 0.0, 1.0};
+  if (!internal::FisheyeFromCamWithJac(
+          u, v, w, &uu, &vv, J_uvw ? J_fisheye_uvw : nullptr)) {
+    return false;
+  }
 
   const double uu2 = uu * uu;
   const double vv2 = vv * vv;
@@ -838,7 +905,7 @@ bool RadialFisheyeCameraModel::ImgFromCamWithJac(const double* params,
     double m[4];
     internal::MatMul2x2(ipjd, J_fisheye, m);
     const double J_ab[4] = {f * m[0], f * m[1], f * m[2], f * m[3]};
-    internal::UvwJacFromAbJac(J_ab, a, b, inv_w, J_uvw);
+    internal::MatMul2x2x3(J_ab, J_fisheye_uvw, J_uvw);
   }
 
   if (J_params) {
@@ -868,9 +935,6 @@ bool OpenCVFisheyeCameraModel::ImgFromCamWithJac(const double* params,
                                                  double* J_params,
                                                  double* J_uvw,
                                                  const bool check_cheirality) {
-  if (!HasProjectableDepth(w, check_cheirality)) {
-    return false;
-  }
 
   const double f1 = params[0];
   const double f2 = params[1];
@@ -881,13 +945,17 @@ bool OpenCVFisheyeCameraModel::ImgFromCamWithJac(const double* params,
   const double k3 = params[6];
   const double k4 = params[7];
 
-  const double inv_w = 1.0 / w;
-  const double a = u * inv_w;
-  const double b = v * inv_w;
-
-  double uu, vv, J_fisheye[4] = {};
-  internal::FisheyeProjectionWithJac(
-      a, b, &uu, &vv, J_uvw ? J_fisheye : nullptr);
+  // (uu, vv) is the chain variable here: everything below differentiates
+  // w.r.t. it (J_fisheye = identity), and d(uu, vv) / d(u, v, w) from
+  // FisheyeFromCamWithJac is applied last. That is what lets theta > 90 deg
+  // (w < 0) through; check_cheirality does not apply to a fisheye.
+  (void)check_cheirality;
+  double uu, vv, J_fisheye_uvw[6] = {};
+  const double J_fisheye[4] = {1.0, 0.0, 0.0, 1.0};
+  if (!internal::FisheyeFromCamWithJac(
+          u, v, w, &uu, &vv, J_uvw ? J_fisheye_uvw : nullptr)) {
+    return false;
+  }
 
   // Radial distortion in the theta-scaled fisheye coordinates.
   const double uu2 = uu * uu;
@@ -913,7 +981,7 @@ bool OpenCVFisheyeCameraModel::ImgFromCamWithJac(const double* params,
     double m[4];
     internal::MatMul2x2(ipjd, J_fisheye, m);
     const double J_ab[4] = {f1 * m[0], f1 * m[1], f2 * m[2], f2 * m[3]};
-    internal::UvwJacFromAbJac(J_ab, a, b, inv_w, J_uvw);
+    internal::MatMul2x2x3(J_ab, J_fisheye_uvw, J_uvw);
   }
 
   if (J_params) {
@@ -951,9 +1019,6 @@ bool ThinPrismFisheyeCameraModel::ImgFromCamWithJac(
     double* J_params,
     double* J_uvw,
     const bool check_cheirality) {
-  if (!HasProjectableDepth(w, check_cheirality)) {
-    return false;
-  }
 
   const double f1 = params[0];
   const double f2 = params[1];
@@ -968,13 +1033,17 @@ bool ThinPrismFisheyeCameraModel::ImgFromCamWithJac(
   const double sx1 = params[10];
   const double sy1 = params[11];
 
-  const double inv_w = 1.0 / w;
-  const double a = u * inv_w;
-  const double b = v * inv_w;
-
-  double uu, vv, J_fisheye[4] = {};
-  internal::FisheyeProjectionWithJac(
-      a, b, &uu, &vv, J_uvw ? J_fisheye : nullptr);
+  // (uu, vv) is the chain variable here: everything below differentiates
+  // w.r.t. it (J_fisheye = identity), and d(uu, vv) / d(u, v, w) from
+  // FisheyeFromCamWithJac is applied last. That is what lets theta > 90 deg
+  // (w < 0) through; check_cheirality does not apply to a fisheye.
+  (void)check_cheirality;
+  double uu, vv, J_fisheye_uvw[6] = {};
+  const double J_fisheye[4] = {1.0, 0.0, 0.0, 1.0};
+  if (!internal::FisheyeFromCamWithJac(
+          u, v, w, &uu, &vv, J_uvw ? J_fisheye_uvw : nullptr)) {
+    return false;
+  }
 
   // Radial + tangential + thin-prism distortion in fisheye coordinates.
   const double uu2 = uu * uu;
@@ -1010,7 +1079,7 @@ bool ThinPrismFisheyeCameraModel::ImgFromCamWithJac(
     double m[4];
     internal::MatMul2x2(ipjd, J_fisheye, m);
     const double J_ab[4] = {f1 * m[0], f1 * m[1], f2 * m[2], f2 * m[3]};
-    internal::UvwJacFromAbJac(J_ab, a, b, inv_w, J_uvw);
+    internal::MatMul2x2x3(J_ab, J_fisheye_uvw, J_uvw);
   }
 
   if (J_params) {
@@ -1056,9 +1125,6 @@ bool RadTanThinPrismFisheyeModel::ImgFromCamWithJac(
     double* J_params,
     double* J_uvw,
     const bool check_cheirality) {
-  if (!HasProjectableDepth(w, check_cheirality)) {
-    return false;
-  }
 
   const double f1 = params[0];
   const double f2 = params[1];
@@ -1072,13 +1138,17 @@ bool RadTanThinPrismFisheyeModel::ImgFromCamWithJac(
   const double s2 = params[14];
   const double s3 = params[15];
 
-  const double inv_w = 1.0 / w;
-  const double a = u * inv_w;
-  const double b = v * inv_w;
-
-  double uu, vv, J_fisheye[4] = {};
-  internal::FisheyeProjectionWithJac(
-      a, b, &uu, &vv, J_uvw ? J_fisheye : nullptr);
+  // (uu, vv) is the chain variable here: everything below differentiates
+  // w.r.t. it (J_fisheye = identity), and d(uu, vv) / d(u, v, w) from
+  // FisheyeFromCamWithJac is applied last. That is what lets theta > 90 deg
+  // (w < 0) through; check_cheirality does not apply to a fisheye.
+  (void)check_cheirality;
+  double uu, vv, J_fisheye_uvw[6] = {};
+  const double J_fisheye[4] = {1.0, 0.0, 0.0, 1.0};
+  if (!internal::FisheyeFromCamWithJac(
+          u, v, w, &uu, &vv, J_uvw ? J_fisheye_uvw : nullptr)) {
+    return false;
+  }
 
   // Radial distortion: (xr, yr) = th_radial * (uu, vv). Also accumulate its
   // derivative th_radial' w.r.t. theta2 and the powers theta2^(i+1) used by the
@@ -1140,9 +1210,9 @@ bool RadTanThinPrismFisheyeModel::ImgFromCamWithJac(
       double m2[4];
       internal::MatMul2x2(B, A, m2);  // d(X, Y) / d(uu, vv)
       double m[4];
-      internal::MatMul2x2(m2, J_fisheye, m);  // d(X, Y) / d(a, b)
+      internal::MatMul2x2(m2, J_fisheye, m);  // d(X, Y) / d(uu, vv)
       const double J_ab[4] = {f1 * m[0], f1 * m[1], f2 * m[2], f2 * m[3]};
-      internal::UvwJacFromAbJac(J_ab, a, b, inv_w, J_uvw);
+      internal::MatMul2x2x3(J_ab, J_fisheye_uvw, J_uvw);
     }
 
     if (J_params) {
@@ -1196,21 +1266,22 @@ bool SimpleFisheyeCameraModel::ImgFromCamWithJac(const double* params,
                                                  double* J_params,
                                                  double* J_uvw,
                                                  const bool check_cheirality) {
-  if (!HasProjectableDepth(w, check_cheirality)) {
-    return false;
-  }
 
   const double f = params[0];
   const double c1 = params[1];
   const double c2 = params[2];
 
-  const double inv_w = 1.0 / w;
-  const double a = u * inv_w;
-  const double b = v * inv_w;
-
-  double uu, vv, J_fisheye[4] = {};
-  internal::FisheyeProjectionWithJac(
-      a, b, &uu, &vv, J_uvw ? J_fisheye : nullptr);
+  // (uu, vv) is the chain variable here: everything below differentiates
+  // w.r.t. it (J_fisheye = identity), and d(uu, vv) / d(u, v, w) from
+  // FisheyeFromCamWithJac is applied last. That is what lets theta > 90 deg
+  // (w < 0) through; check_cheirality does not apply to a fisheye.
+  (void)check_cheirality;
+  double uu, vv, J_fisheye_uvw[6] = {};
+  const double J_fisheye[4] = {1.0, 0.0, 0.0, 1.0};
+  if (!internal::FisheyeFromCamWithJac(
+          u, v, w, &uu, &vv, J_uvw ? J_fisheye_uvw : nullptr)) {
+    return false;
+  }
 
   *x = f * uu + c1;
   *y = f * vv + c2;
@@ -1218,7 +1289,7 @@ bool SimpleFisheyeCameraModel::ImgFromCamWithJac(const double* params,
   if (J_uvw) {
     const double J_ab[4] = {
         f * J_fisheye[0], f * J_fisheye[1], f * J_fisheye[2], f * J_fisheye[3]};
-    internal::UvwJacFromAbJac(J_ab, a, b, inv_w, J_uvw);
+    internal::MatMul2x2x3(J_ab, J_fisheye_uvw, J_uvw);
   }
 
   if (J_params) {
@@ -1244,22 +1315,23 @@ bool FisheyeCameraModel::ImgFromCamWithJac(const double* params,
                                            double* J_params,
                                            double* J_uvw,
                                            const bool check_cheirality) {
-  if (!HasProjectableDepth(w, check_cheirality)) {
-    return false;
-  }
 
   const double f1 = params[0];
   const double f2 = params[1];
   const double c1 = params[2];
   const double c2 = params[3];
 
-  const double inv_w = 1.0 / w;
-  const double a = u * inv_w;
-  const double b = v * inv_w;
-
-  double uu, vv, J_fisheye[4] = {};
-  internal::FisheyeProjectionWithJac(
-      a, b, &uu, &vv, J_uvw ? J_fisheye : nullptr);
+  // (uu, vv) is the chain variable here: everything below differentiates
+  // w.r.t. it (J_fisheye = identity), and d(uu, vv) / d(u, v, w) from
+  // FisheyeFromCamWithJac is applied last. That is what lets theta > 90 deg
+  // (w < 0) through; check_cheirality does not apply to a fisheye.
+  (void)check_cheirality;
+  double uu, vv, J_fisheye_uvw[6] = {};
+  const double J_fisheye[4] = {1.0, 0.0, 0.0, 1.0};
+  if (!internal::FisheyeFromCamWithJac(
+          u, v, w, &uu, &vv, J_uvw ? J_fisheye_uvw : nullptr)) {
+    return false;
+  }
 
   *x = f1 * uu + c1;
   *y = f2 * vv + c2;
@@ -1269,7 +1341,7 @@ bool FisheyeCameraModel::ImgFromCamWithJac(const double* params,
                             f1 * J_fisheye[1],
                             f2 * J_fisheye[2],
                             f2 * J_fisheye[3]};
-    internal::UvwJacFromAbJac(J_ab, a, b, inv_w, J_uvw);
+    internal::MatMul2x2x3(J_ab, J_fisheye_uvw, J_uvw);
   }
 
   if (J_params) {
