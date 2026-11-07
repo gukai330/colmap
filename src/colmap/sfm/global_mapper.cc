@@ -480,13 +480,32 @@ bool GlobalMapper::IterativeRetriangulateAndRefine(
   // Iterative global refinement.
   IncrementalMapper::Options mapper_options;
   mapper_options.random_seed = options.random_seed;
+  // recon360: the 4.1.1 refinement -- the mapper's own BA options (intrinsics
+  // and poses refined, Huber loss), capped at 50 / 100 iterations -- not
+  // 4.2.1's points-only, trivial-loss RefinementBundleAdjustmentOptions
+  // (#4754). With intrinsics frozen here, the observations that carry the
+  // calibration residual -- the fisheye rim -- are the ones each filter pass
+  // removes: on a 2024-image dual-fisheye scene 4.2.1 kept 7.8 % fewer
+  // theta > 90 deg observations than 4.1.1 on the same database, falling off
+  // monotonically past 85 deg (0.883 at 92-94 deg), and its intrinsics drifted
+  // 0.15 px; this block brings both back (116,589 vs 116,719; <= 0.004 px) for
+  // +290 s of refinement. RefinementBundleAdjustmentOptions is kept for
+  // reference but unused.
+  BundleAdjustmentOptions custom_ba_options = ba_options;
+  custom_ba_options.print_summary = false;
+  if (custom_ba_options.ceres && ba_options.ceres) {
+    custom_ba_options.ceres->solver_options.num_threads =
+        ba_options.ceres->solver_options.num_threads;
+    custom_ba_options.ceres->solver_options.max_num_iterations = 50;
+    custom_ba_options.ceres->solver_options.max_linear_solver_iterations = 100;
+  }
   mapper.IterativeGlobalRefinement(
       /*max_num_refinements=*/5,
       /*max_refinement_change=*/0.0005,
       mapper_options,
-      RefinementBundleAdjustmentOptions(ba_options),
+      custom_ba_options,
       options,
-      /*normalize_reconstruction=*/false);
+      /*normalize_reconstruction=*/true);
 
   mapper.EndReconstruction(/*discard=*/false);
 
