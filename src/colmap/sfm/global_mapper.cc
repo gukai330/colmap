@@ -480,13 +480,26 @@ bool GlobalMapper::IterativeRetriangulateAndRefine(
   // Iterative global refinement.
   IncrementalMapper::Options mapper_options;
   mapper_options.random_seed = options.random_seed;
+  // EXPERIMENT (recon360-4.2-exp-refine): the 4.1.1 refinement -- full BA
+  // options (intrinsics + poses refined, the mapper's loss) with 50/100
+  // iterations -- instead of 4.2.1's points-only, trivial-loss
+  // RefinementBundleAdjustmentOptions (#4754), to test whether the latter is
+  // why 4.2.1 keeps fewer theta > 85 deg observations on the same database.
+  BundleAdjustmentOptions custom_ba_options = ba_options;
+  custom_ba_options.print_summary = false;
+  if (custom_ba_options.ceres && ba_options.ceres) {
+    custom_ba_options.ceres->solver_options.num_threads =
+        ba_options.ceres->solver_options.num_threads;
+    custom_ba_options.ceres->solver_options.max_num_iterations = 50;
+    custom_ba_options.ceres->solver_options.max_linear_solver_iterations = 100;
+  }
   mapper.IterativeGlobalRefinement(
       /*max_num_refinements=*/5,
       /*max_refinement_change=*/0.0005,
       mapper_options,
-      RefinementBundleAdjustmentOptions(ba_options),
+      custom_ba_options,
       options,
-      /*normalize_reconstruction=*/false);
+      /*normalize_reconstruction=*/true);
 
   mapper.EndReconstruction(/*discard=*/false);
 
