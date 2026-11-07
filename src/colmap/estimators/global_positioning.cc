@@ -64,6 +64,30 @@ bool GlobalPositioner::Solve(const PoseGraph& pose_graph,
   options_.solver_options.minimizer_progress_to_stdout = VLOG_IS_ON(2);
   ceres::Solve(options_.solver_options, problem_.get(), &summary);
 
+  // A GPU solve can fail for reasons that have nothing to do with the problem:
+  // cuDSS needs the whole factorization in device memory, and on a 12 GB card
+  // a 2024-image dual-fisheye scene (573k tracks) dies at the first iteration
+  // with CUDSS_STATUS_ALLOC_FAILED. Bundle adjustment retries such failures on
+  // the CPU (SolveWithGpuFallback); global positioning did not, so the whole
+  // global_mapping failed. A FAILURE termination leaves the parameters at their
+  // last accepted values, so re-solving the same problem with the CPU solvers
+  // is safe.
+  const bool used_gpu_solver =
+      options_.solver_options.sparse_linear_algebra_library_type ==
+          ceres::CUDA_SPARSE ||
+      options_.solver_options.dense_linear_algebra_library_type == ceres::CUDA;
+  if (summary.termination_type == ceres::FAILURE && used_gpu_solver) {
+    LOG(WARNING) << "GPU global positioning failed (" << summary.message
+                 << "), retrying with CPU.";
+    options_.solver_options.sparse_linear_algebra_library_type =
+        ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::SUITE_SPARSE)
+            ? ceres::SUITE_SPARSE
+            : ceres::EIGEN_SPARSE;
+    options_.solver_options.dense_linear_algebra_library_type = ceres::EIGEN;
+    summary = ceres::Solver::Summary();
+    ceres::Solve(options_.solver_options, problem_.get(), &summary);
+  }
+
   if (VLOG_IS_ON(2)) {
     LOG(INFO) << summary.FullReport();
   } else {
